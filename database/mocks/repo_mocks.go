@@ -248,6 +248,14 @@ func (m *MockDataSource) UpdateTransactionMetadata(ctx context.Context, id strin
 	return args.Error(0)
 }
 
+func (m *MockDataSource) ListTransactionsByMetadataScope(ctx context.Context, scopeID string, limit int, offset int64) ([]*model.Transaction, error) {
+	args := m.Called(ctx, scopeID, limit, offset)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*model.Transaction), args.Error(1)
+}
+
 func (m *MockDataSource) UpdateBalanceMetadata(ctx context.Context, id string, metadata map[string]interface{}) error {
 	args := m.Called(ctx, id, metadata)
 	return args.Error(0)

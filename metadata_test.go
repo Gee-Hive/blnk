@@ -337,9 +337,9 @@ func TestUpdateMetadata_EmitsWebhookForEachEntity(t *testing.T) {
 			setupMock: func(mockDS *mocks.MockDataSource, newMetadata map[string]interface{}) {
 				mockDS.On("TransactionExistsByIDOrParentID", mock.Anything, "txn_wh_1").Return(true, nil).Once()
 				mockDS.On("UpdateTransactionMetadata", mock.Anything, "txn_wh_1", newMetadata).Return(nil).Once()
-				// Metadata index reindexes the full row asynchronously; stub it
-				// with .Maybe() since this test only asserts the webhook payload.
-				mockDS.On("GetTransaction", mock.Anything, "txn_wh_1").Return(&model.Transaction{TransactionID: "txn_wh_1"}, nil).Maybe()
+				// Metadata index lists every row in the update scope asynchronously.
+				mockDS.On("ListTransactionsByMetadataScope", mock.Anything, "txn_wh_1", mock.Anything, mock.Anything).
+					Return([]*model.Transaction{{TransactionID: "txn_wh_1"}}, nil).Maybe()
 			},
 			assertData: func(t *testing.T, data map[string]interface{}) {
 				assert.Equal(t, "txn_wh_1", data["transaction_id"])
@@ -414,10 +414,10 @@ func TestUpdateMetadata_TransactionPatchPayloadWithoutRefetch(t *testing.T) {
 	newMetadata := map[string]interface{}{"tag": "bulk"}
 	mockDS.On("TransactionExistsByIDOrParentID", mock.Anything, "bulk_wh_1").Return(true, nil).Once()
 	mockDS.On("UpdateTransactionMetadata", mock.Anything, "bulk_wh_1", newMetadata).Return(nil).Once()
-	// Webhook payload is built from the committed patch, without refetching.
-	// Metadata index reindexes the full row asynchronously and independently;
-	// stub it with .Maybe() since it is not the concern of this test.
-	mockDS.On("GetTransaction", mock.Anything, "bulk_wh_1").Return(&model.Transaction{TransactionID: "bulk_wh_1"}, nil).Maybe()
+	mockDS.On("ListTransactionsByMetadataScope", mock.Anything, "bulk_wh_1", mock.Anything, mock.Anything).
+		Return([]*model.Transaction{
+			{TransactionID: "txn_child_1", ParentTransaction: "bulk_wh_1"},
+		}, nil).Maybe()
 
 	b, queueName := setupMetadataWebhookBlnk(t, mockDS, "http://localhost:1/webhooks")
 	_, err := b.UpdateMetadata(context.Background(), "bulk_wh_1", newMetadata)
@@ -456,12 +456,12 @@ func TestUpdateMetadata_TransactionIndexUsesFullDocumentNotPatch(t *testing.T) {
 	}
 	mockDS.On("TransactionExistsByIDOrParentID", mock.Anything, "txn_idx_1").Return(true, nil).Once()
 	mockDS.On("UpdateTransactionMetadata", mock.Anything, "txn_idx_1", newMetadata).Return(nil).Once()
-	// Index path must call GetTransaction to fetch the full row. Record completion
-	// via an atomic flag in Run — polling mock.Calls races with the async goroutine
+	// Index path lists rows in the metadata scope. Record completion via an
+	// atomic flag in Run — polling mock.Calls races with the async goroutine
 	// under -race because testify mutates Calls concurrently.
 	var indexFetchDone atomic.Bool
-	mockDS.On("GetTransaction", mock.Anything, "txn_idx_1").
-		Return(fullTxn, nil).
+	mockDS.On("ListTransactionsByMetadataScope", mock.Anything, "txn_idx_1", mock.Anything, mock.Anything).
+		Return([]*model.Transaction{fullTxn}, nil).
 		Run(func(mock.Arguments) { indexFetchDone.Store(true) }).
 		Once()
 
@@ -482,7 +482,7 @@ func TestUpdateMetadata_TransactionIndexUsesFullDocumentNotPatch(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return indexFetchDone.Load()
-	}, 2*time.Second, 10*time.Millisecond, "expected GetTransaction to be called to build the full index document")
+	}, 2*time.Second, 10*time.Millisecond, "expected metadata scope listing to build the full index document")
 
 	mockDS.AssertExpectations(t)
 }
@@ -674,19 +674,18 @@ func TestUpdateMetadata_BulkTransactionAppliesRawPatch(t *testing.T) {
 	// must be handed to the DB so the JSONB merge stays server-side.
 	mockDS.On("UpdateTransactionMetadata", mock.Anything, "bulk_meta_1", patch).Return(nil).Once()
 
-	var indexFetchDone atomic.Bool
-	mockDS.On("GetTransaction", mock.Anything, "bulk_meta_1").
-		Return(&model.Transaction{TransactionID: "bulk_meta_1", Amount: 250, Currency: "USD"}, nil).
-		Run(func(mock.Arguments) { indexFetchDone.Store(true) }).
-		Maybe()
+	childOne := &model.Transaction{TransactionID: "txn_bulk_child_1", ParentTransaction: "bulk_meta_1", Amount: 100, Currency: "USD"}
+	childTwo := &model.Transaction{TransactionID: "txn_bulk_child_2", ParentTransaction: "bulk_meta_1", Amount: 150, Currency: "USD"}
+	mockDS.On("ListTransactionsByMetadataScope", mock.Anything, "bulk_meta_1", mock.Anything, mock.Anything).
+		Return([]*model.Transaction{childOne, childTwo}, nil).Once()
 
-	b, queueName := setupMetadataWebhookBlnk(t, mockDS, "http://localhost:1/webhooks")
+	b, webhookQueue, indexQueue := setupMetadataQueuesBlnk(t, mockDS, "http://localhost:1/webhooks")
 
 	returned, err := b.UpdateMetadata(context.Background(), "bulk_meta_1", patch)
 	require.NoError(t, err)
 	assert.Equal(t, patch, returned, "bulk updates report the applied patch, not a synthesized merge")
 
-	tasks := listWebhookTasks(t, b.Config().Redis.Dns, queueName)
+	tasks := listWebhookTasks(t, b.Config().Redis.Dns, webhookQueue)
 	require.Len(t, tasks, 1)
 	event, data := decodeMetadataWebhook(t, tasks[0])
 	assert.Equal(t, "transaction.metadata.updated", event)
@@ -698,9 +697,28 @@ func TestUpdateMetadata_BulkTransactionAppliesRawPatch(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "B-42", appliedPatch["settlement_batch"])
 
+	indexedIDs := map[string]struct{}{}
 	require.Eventually(t, func() bool {
-		return indexFetchDone.Load()
-	}, 2*time.Second, 10*time.Millisecond, "bulk reindex must re-read the rows rather than index the patch")
+		indexTasks := listQueuedTasks(t, b.Config().Redis.Dns, indexQueue)
+		for _, task := range indexTasks {
+			var payload struct {
+				Collection string                 `json:"collection"`
+				Payload    map[string]interface{} `json:"payload"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err != nil {
+				continue
+			}
+			if payload.Collection != "transactions" {
+				continue
+			}
+			if id, _ := payload.Payload["transaction_id"].(string); id != "" {
+				indexedIDs[id] = struct{}{}
+			}
+		}
+		return len(indexedIDs) == 2
+	}, 2*time.Second, 10*time.Millisecond, "bulk reindex must enqueue every child row in the metadata scope")
+	assert.Contains(t, indexedIDs, "txn_bulk_child_1")
+	assert.Contains(t, indexedIDs, "txn_bulk_child_2")
 	mockDS.AssertExpectations(t)
 }
 

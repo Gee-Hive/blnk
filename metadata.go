@@ -126,15 +126,14 @@ func cloneMetadata(src map[string]interface{}) map[string]interface{} {
 //
 // The resulting guarantee is therefore:
 //   - the merge is authoritative and reported as 200 once committed;
-//   - event delivery is at-least-once, and asynq redelivers this exact
-//     payload, so retried deliveries carry the same event_id;
-//   - an enqueue failure drops the notification for that update. It is logged
-//     and reported through notification.NotifyError so it is observable, and
-//     entity state remains readable via the API.
-//
-// If a lost notification is ever unacceptable, the fix is a transactional
-// outbox (write the event in the same DB transaction as the merge and let a
-// processor publish it, as blnk.lineage_outbox does), not failing the request.
+//   - event delivery is at-least-once only after a successful Redis enqueue;
+//     if enqueue fails after commit the notification is permanently dropped
+//     (logged and sent to notification.NotifyError). Consumers must treat
+//     the API as the source of truth and may poll when webhook delivery is
+//     required. A transactional outbox is the upgrade path if lossless
+//     notification becomes a requirement;
+//   - asynq redelivers this exact payload on worker retry, so retried
+//     deliveries carry the same event_id;
 //
 // No-ops when asynq is unset or no webhook URL is configured. Only called from
 // UpdateMetadata so internal metadata writers stay silent.
@@ -212,23 +211,38 @@ func (l *Blnk) queueBalanceMetadataIndex(entityID string) {
 	}()
 }
 
-// queueTransactionMetadataIndex reindexes the full transaction row after a
-// metadata update. Unlike the other entity types, the transaction webhook
-// payload is a patch, not the merged document, so indexing re-fetches the
-// current row instead of reusing that payload. Best-effort: a fetch or index
-// failure is reported via NotifyError and does not affect the API response.
+// queueTransactionMetadataIndex reindexes every transaction row touched by the
+// metadata update. UpdateTransactionMetadata matches transaction_id = scope OR
+// parent_transaction = scope, so a bulk_ ID can update many child rows while
+// GetTransaction(scope) finds none. Paginate the same scope the UPDATE used.
+// Best-effort: fetch or index failures are reported via NotifyError and do not
+// affect the API response.
 func (l *Blnk) queueTransactionMetadataIndex(entityID string) {
 	if l.queue == nil {
 		return
 	}
 	go func() {
-		updatedTransaction, err := l.GetTransaction(context.Background(), entityID)
-		if err != nil {
-			notification.NotifyError(err)
-			return
-		}
-		if err := l.queue.queueIndexData(entityID, "transactions", updatedTransaction); err != nil {
-			notification.NotifyError(err)
+		const pageSize = 100
+		ctx := context.Background()
+		var offset int64
+		for {
+			txns, err := l.datasource.ListTransactionsByMetadataScope(ctx, entityID, pageSize, offset)
+			if err != nil {
+				notification.NotifyError(err)
+				return
+			}
+			if len(txns) == 0 {
+				return
+			}
+			for _, txn := range txns {
+				if err := l.queue.queueIndexData(txn.TransactionID, "transactions", txn); err != nil {
+					notification.NotifyError(err)
+				}
+			}
+			if len(txns) < pageSize {
+				return
+			}
+			offset += int64(len(txns))
 		}
 	}()
 }
